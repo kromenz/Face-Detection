@@ -1,0 +1,1 @@
+dá load à cache e começa a dar encode Às mesmas imagens

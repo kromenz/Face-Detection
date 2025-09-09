@@ -2,3 +2,4 @@ opencv-python
 imgbeddings
 psycopg2-binary
 face_recognition
+icrawler
