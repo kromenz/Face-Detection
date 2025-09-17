@@ -121,6 +121,8 @@ class SimpleFacerec:
                         ok_count += 1
                         total_images += 1
 
+                    continue
+                
                 # cache miss: compute encoding
                 img = cv2.imread(img_path)
                 if img is None:

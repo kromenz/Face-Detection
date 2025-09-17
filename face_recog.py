@@ -1,4 +1,3 @@
-# main_tracking_improved.py
 import cv2
 import numpy as np
 import time
@@ -29,6 +28,12 @@ MATCH_TOLERANCE = 0.6         # fallback tolerance to mark as known (unused if u
 TRACKER_TYPE = "KCF"          # options: "KCF", "CSRT" (CSRT more accurate but slower)
 MAX_TRACKER_LOST_TIME = 1.2   # seconds until we drop a tracker that stopped updating
 MAX_TRACKERS = 12            # limit total trackers to avoid overload
+
+SIZE_THRESHOLD = 0.25
+SIZE_FRAMES = 3
+MAX_SCALE = 3.0
+MIN_SCALE = 0.5
+REFINE_PARAMS = dict(pad_x=0.02, pad_y_top=0.02, pad_y_bottom=0.05)
 
 # -----------------------------
 # Helpers
@@ -81,80 +86,130 @@ def size_change_frac(loc1, loc2):
         return 1.0
     return max(abs(w2 - w1) / w1, abs(h2 - h1) / h1)
 
-def refine_bbox_with_landmarks(frame, bbox, pad_x=0.05, pad_y_top=0.10, pad_y_bottom=0.10):
+def refine_bbox_with_landmarks(frame, bbox, det_bbox=None,
+                              pad_x=0.02, pad_y_top=0.02, pad_y_bottom=0.05,
+                              force_square=False, min_size=20, debug=False):
+
     x0, y0, x1, y1 = bbox
     h_img, w_img = frame.shape[:2]
 
-    x0c = max(0, x0); y0c = max(0, y0)
-    x1c = min(w_img, x1); y1c = min(h_img, y1)
+    x0c = max(0, int(x0)); y0c = max(0, int(y0))
+    x1c = min(w_img, int(x1)); y1c = min(h_img, int(y1))
     if x1c - x0c <= 10 or y1c - y0c <= 10:
-        return (x0c, y0c, x1c, y1c)
+        return (x0c, y0c, x1c, y1c) if not debug else ((x0c, y0c, x1c, y1c), frame.copy())
+
+    # detection box to base adaptive padding on (fallback to current bbox)
+    if det_bbox is None:
+        det_x0, det_y0, det_x1, det_y1 = x0c, y0c, x1c, y1c
+    else:
+        det_x0, det_y0, det_x1, det_y1 = (max(0,int(det_bbox[0])), max(0,int(det_bbox[1])),
+                                          min(w_img,int(det_bbox[2])), min(h_img,int(det_bbox[3])))
+    det_w = max(1, det_x1 - det_x0)
+    det_h = max(1, det_y1 - det_y0)
 
     crop = frame[y0c:y1c, x0c:x1c]
     try:
         rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     except Exception:
-        return (x0c, y0c, x1c, y1c)
+        return (x0c, y0c, x1c, y1c) if not debug else ((x0c, y0c, x1c, y1c), frame.copy())
 
     landmarks = face_recognition.face_landmarks(rgb)
     if not landmarks:
-
-        w = x1c - x0c
-        h = y1c - y0c
-        px = int(w * pad_x)
-        py_top = int(h * pad_y_top)
-        py_bottom = int(h * pad_y_bottom)
-        nx0 = max(0, x0c - px)
-        ny0 = max(0, y0c - py_top)
-        nx1 = min(w_img, x1c + px)
-        ny1 = min(h_img, y1c + py_bottom)
+        shrink = 0.88
+        nw = max(min_size, int(det_w * shrink))
+        nh = max(min_size, int(det_h * shrink))
+        cx = (det_x0 + det_x1) // 2
+        cy = (det_y0 + det_y1) // 2
+        nx0 = max(0, cx - nw // 2)
+        ny0 = max(0, cy - nh // 2)
+        nx1 = min(w_img, nx0 + nw)
+        ny1 = min(h_img, ny0 + nh)
+        if debug:
+            out = frame.copy()
+            cv2.rectangle(out, (det_x0, det_y0), (det_x1, det_y1), (0,120,255), 1)
+            cv2.rectangle(out, (nx0, ny0), (nx1, ny1), (0,255,0), 2)
+            return (nx0, ny0, nx1, ny1), out
         return (nx0, ny0, nx1, ny1)
 
     all_x = []
     all_y = []
     for lm in landmarks:
         for part in lm.values():
-            for (px, py) in part:
-                all_x.append(px)
-                all_y.append(py)
+            for (px_coord, py_coord) in part:
+                all_x.append(px_coord)
+                all_y.append(py_coord)
+
     if not all_x or not all_y:
-        # fallback padding
-        w = x1c - x0c; h = y1c - y0c
-        px = int(w * pad_x)
-        py_top = int(h * pad_y_top)
-        py_bottom = int(h * pad_y_bottom)
-        nx0 = max(0, x0c - px)
-        ny0 = max(0, y0c - py_top)
-        nx1 = min(w_img, x1c + px)
-        ny1 = min(h_img, y1c + py_bottom)
-        return (nx0, ny0, nx1, ny1)
+        return refine_bbox_with_landmarks(frame, (x0c,y0c,x1c,y1c), det_bbox, pad_x, pad_y_top, pad_y_bottom, force_square, min_size, debug)
 
     min_x = min(all_x); max_x = max(all_x)
     min_y = min(all_y); max_y = max(all_y)
+    lm_x0 = x0c + int(min_x)
+    lm_y0 = y0c + int(min_y)
+    lm_x1 = x0c + int(max_x)
+    lm_y1 = y0c + int(max_y)
 
-    lm_x0 = x0c + min_x
-    lm_y0 = y0c + min_y
-    lm_x1 = x0c + max_x
-    lm_y1 = y0c + max_y
+    w_l = max(1, lm_x1 - lm_x0)
+    h_l = max(1, lm_y1 - lm_y0)
 
-    w_l = lm_x1 - lm_x0
-    h_l = lm_y1 - lm_y0
-    px = int(w_l * pad_x)
-    py_top = int(h_l * pad_y_top)
-    py_bottom = int(h_l * pad_y_bottom)
+    # padding based on landmarks and also a fallback fraction of detector bbox
+    px_land = int(w_l * pad_x)
+    py_top_land = int(h_l * pad_y_top)
+    py_bottom_land = int(h_l * pad_y_bottom)
 
-    nx0 = max(0, lm_x0 - px)
-    ny0 = max(0, lm_y0 - py_top)
-    nx1 = min(w_img, lm_x1 + px)
-    ny1 = min(h_img, lm_y1 + py_bottom)
+    # percent of detector to use if landmark bbox is "too small"
+    px_det = int(det_w * max(pad_x, 0.06))       # at least ~6% of detector width if small
+    py_top_det = int(det_h * max(pad_y_top, 0.06))
+    py_bottom_det = int(det_h * max(pad_y_bottom, 0.06))
 
-    if nx1 - nx0 < 20 or ny1 - ny0 < 20:
-        nx0 = max(0, x0c - int((x1c-x0c) * pad_x))
-        nx1 = min(w_img, x1c + int((x1c-x0c) * pad_x))
-        ny0 = max(0, y0c - int((y1c-y0c) * pad_y_top))
-        ny1 = min(h_img, y1c + int((y1c-y0c) * pad_y_bottom))
+    # choose the larger padding when landmarks are small relative to detector
+    # threshold: if landmarks are < 75% of detector width -> use detector-based padding
+    if w_l < det_w * 0.75:
+        px = max(px_land, px_det)
+    else:
+        px = px_land
 
-    return (int(nx0), int(ny0), int(nx1), int(ny1))
+    if h_l < det_h * 0.75:
+        py_top = max(py_top_land, py_top_det)
+        py_bottom = max(py_bottom_land, py_bottom_det)
+    else:
+        py_top = py_top_land
+        py_bottom = py_bottom_land
+
+    # build refined bbox but clamp inside the detection bbox to avoid runaway expansion
+    nx0 = max(det_x0, lm_x0 - px)
+    ny0 = max(det_y0, lm_y0 - py_top)
+    nx1 = min(det_x1, lm_x1 + px)
+    ny1 = min(det_y1, lm_y1 + py_bottom)
+
+    # ensure minimum sizes
+    if (nx1 - nx0) < min_size:
+        cx = (nx0 + nx1) // 2
+        nx0 = max(0, cx - min_size // 2); nx1 = min(w_img, nx0 + min_size)
+    if (ny1 - ny0) < min_size:
+        cy = (ny0 + ny1) // 2
+        ny0 = max(0, cy - min_size // 2); ny1 = min(h_img, ny0 + min_size)
+
+    # optional square
+    if force_square:
+        bx = nx1 - nx0; by = ny1 - ny0
+        side = max(bx, by)
+        cx = (nx0 + nx1) // 2; cy = (ny0 + ny1) // 2
+        nx0 = max(0, cx - side // 2); ny0 = max(0, cy - side // 2)
+        nx1 = min(w_img, nx0 + side); ny1 = min(h_img, ny0 + side)
+
+    nx0, ny0, nx1, ny1 = int(nx0), int(ny0), int(nx1), int(ny1)
+    if debug:
+        out = frame.copy()
+        cv2.rectangle(out, (det_x0, det_y0), (det_x1, det_y1), (0,120,255), 1)
+        for lm in landmarks:
+            for part in lm.values():
+                for (px_coord, py_coord) in part:
+                    cv2.circle(out, (x0c + px_coord, y0c + py_coord), 1, (0,0,255), -1)
+        cv2.rectangle(out, (nx0, ny0), (nx1, ny1), (0,255,0), 2)
+        return (nx0, ny0, nx1, ny1), out
+
+    return (nx0, ny0, nx1, ny1)
 
 sfr = SimpleFacerec()
 sfr.load_encoding_images("faces/", cache_file="cache/enc_cache.pkl", use_hash=True)   # assumes images/<person>/* structure
